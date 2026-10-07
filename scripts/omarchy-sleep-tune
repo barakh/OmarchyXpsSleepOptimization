@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# omarchy-sleep-tune - manage s2idle battery drain on Omarchy (Dell XPS 13 Plus 9320)
+#
+#   omarchy-sleep-tune status     show current tuning state (no root needed)
+#   omarchy-sleep-tune apply      apply tuning now (root)
+#   omarchy-sleep-tune install    install self to /usr/local/bin + persist (root)
+#   omarchy-sleep-tune uninstall  remove the persistent unit and hooks (root)
+#   omarchy-sleep-tune measure    print measured sleep drain history
+#
+# The S0ix fix itself (pcie_aspm=force) is handled by aspm-force.sh; this script
+# covers the userspace bits: Wi-Fi power save, powertop auto-tune, ACPI/USB wake
+# trimming, and suspend/resume logging of drain and S0ix residency.
+#
+# Persistence is our own systemd unit because Arch's powertop package ships none.
+
+set -uo pipefail
+
+DEST=/usr/local/bin/omarchy-sleep-tune
+STATE_DIR=/var/lib/omarchy-sleep-tune
+LOG=/var/log/omarchy-sleep-tune.log
+BAT=/sys/class/power_supply/BAT0
+UNIT=/etc/systemd/system/omarchy-sleep-tune.service
+HOOKDIR=/usr/lib/systemd/system-sleep
+HOOK=$HOOKDIR/omarchy-sleep-measure
+S0IX_HOOK=$HOOKDIR/omarchy-s0ix-measure
+PMC=/sys/kernel/debug/pmc_core/slp_s0_residency_usec
+CONF=/etc/omarchy-sleep-tune.conf
+
+# Never disable these: without a wake path the machine is stranded until power off.
+NEVER_DISABLE="LID0 PBTN"
+DEFAULT_KEEP="AWAC XHCI TXHC TRP0 TRP2"
+DEFAULT_DISABLE="TDM0 TDM1"
+
+say() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+need_root() { [ "$(id -u)" = 0 ] || { echo "needs root: sudo $0 $*" >&2; exit 1; }; }
+
+in_list() { local n=$1 l=$2; for w in $l; do [ "$w" = "$n" ] && return 0; done; return 1; }
+
+keep_list() {
+  local keep="$DEFAULT_KEEP"
+  [ -r "$CONF" ] && keep="${KEEP:-$keep}"
+  echo "$keep"
+}
+
+disable_list() {
+  local dis="$DEFAULT_DISABLE"
+  [ -r "$CONF" ] && dis="${DISABLE:-$dis}"
+  echo "$dis"
+}
+
+acpi_enabled() { awk '$3 == "*enabled" {print $1}' /proc/acpi/wakeup 2>/dev/null; }
+
+show_usb() {
+  local d n
+  for d in /sys/bus/usb/devices/*/; do
+    [ -f "$d/power/wakeup" ] || continue
+    n=$(cat "$d/product" 2>/dev/null || basename "$d")
+    printf '   %-36s wakeup=%-9s control=%-5s runtime=%s\n' \
+      "$n" "$(cat "$d/power/wakeup")" "$(cat "$d/power/control")" "$(cat "$d/power/runtime_status")"
+  done
+}
+
+snapshot_usb() {
+  [ -f "$STATE_DIR/usb-wakeup.state" ] && return 0
+  mkdir -p "$STATE_DIR"
+  local d
+  for d in /sys/bus/usb/devices/*/; do
+    [ -f "$d/power/wakeup" ] || continue
+    printf '%s %s\n' "$(basename "$d")" "$(cat "$d/power/wakeup")" >> "$STATE_DIR/usb-wakeup.state"
+  done
+}
+
+restore_usb() {
+  [ -r "$STATE_DIR/usb-wakeup.state" ] || return 0
+  local id want f
+  while read -r id want; do
+    f="/sys/bus/usb/devices/$id/power/wakeup"
+    [ -e "$f" ] || continue
+    [ "$want" = enabled ] || continue
+    [ "$(cat "$f")" = enabled ] && continue
+    echo on > "/sys/bus/usb/devices/$id/power/control" 2>/dev/null
+    echo enabled > "$f" 2>/dev/null && printf '   restored wakeup for usb %s\n' "$id"
+  done < "$STATE_DIR/usb-wakeup.state"
+}
+
+tune_wifi() {
+  printf 'options iwlwifi power_save=1\n' > /etc/modprobe.d/iwlwifi-power-save.conf
+  if echo 1 > /sys/module/iwlwifi/parameters/power_save 2>/dev/null; then
+    echo "   iwlwifi power_save=$(cat /sys/module/iwlwifi/parameters/power_save)"
+  else
+    echo "   iwlwifi power_save=$(cat /sys/module/iwlwifi/parameters/power_save 2>/dev/null) (persisted; applies on reconnect/reboot)"
+  fi
+}
+
+tune_powertop() {
+  if ! command -v powertop >/dev/null; then
+    echo "   powertop not installed - skipping (omarchy pkg add powertop)"
+    return 0
+  fi
+  powertop --auto-tune && echo "   powertop --auto-tune: ok ($(powertop --version 2>/dev/null | tail -1))"
+}
+
+tune_acpi() {
+  local keep disable dev
+  keep=$(keep_list)
+  disable=$(disable_list)
+  for dev in $disable; do
+    in_list "$dev" "$NEVER_DISABLE" && continue
+    acpi_enabled | grep -qx "$dev" || continue
+    if echo "$dev" > /proc/acpi/wakeup 2>/dev/null; then
+      echo "   disabled ACPI wake source: $dev"
+    else
+      echo "   FAILED to disable $dev"
+    fi
+  done
+  for dev in $(acpi_enabled); do
+    in_list "$dev" "$keep" && continue
+    in_list "$dev" "$NEVER_DISABLE" && continue
+    in_list "$dev" "$disable" && continue
+    printf '   still enabled (not on trim list): %s\n' "$dev"
+  done
+}
+
+cmd_apply() {
+  need_root apply
+  mkdir -p "$STATE_DIR"
+  say "wifi power save"
+  tune_wifi
+  say "powertop auto-tune (balanced)"
+  tune_powertop
+  say "usb wakeups"
+  restore_usb
+  say "acpi wake sources"
+  tune_acpi
+  printf '\n[apply %s] applied\n' "$(date -Is)" >> "$LOG"
+}
+
+cmd_status() {
+  say "sleep mode"
+  printf '   mem_sleep: %s\n' "$(cat /sys/power/mem_sleep 2>/dev/null)"
+  say "pcie aspm"
+  printf '   policy: %s\n' "$(cat /sys/module/pcie_aspm/parameters/policy 2>/dev/null || echo 'module not loaded')"
+  say "wifi"
+  printf '   iwlwifi power_save: %s   modprobe.d: %s\n' \
+    "$(cat /sys/module/iwlwifi/parameters/power_save 2>/dev/null || echo n/a)" \
+    "$([ -r /etc/modprobe.d/iwlwifi-power-save.conf ] && cat /etc/modprobe.d/iwlwifi-power-save.conf || echo absent)"
+  say "powertop"
+  printf '   %s   unit enabled: %s\n' \
+    "$(powertop --version 2>/dev/null | tail -1 || echo 'not installed')" \
+    "$(systemctl is-enabled omarchy-sleep-tune.service 2>/dev/null)"
+  say "acpi wake sources currently enabled"
+  acpi_enabled | sed 's/^/   /'
+  say "usb devices"
+  show_usb
+  say "last applied"
+  tail -1 "$LOG" 2>/dev/null | sed 's/^/   /' || echo "   never"
+}
+
+cmd_measure() {
+  [ -r "$LOG" ] || { echo "no measurements yet ($LOG)"; exit 1; }
+  printf '%-22s %-8s %-10s %s\n' WHEN RESULT DETAIL STATE
+  grep -E '^\[(measure|s0ix|suspend)' "$LOG" | tail -40
+}
+
+write_unit() {
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=Apply s2idle battery tuning (omarchy-sleep-tune)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DEST apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_hook() {
+  mkdir -p "$HOOKDIR"
+  cat > "$HOOK" <<EOF
+#!/usr/bin/env bash
+# Suspend/resume drain measurement. Called by systemd with pre|post|post-resume.
+BAT=$BAT
+LOG=$LOG
+ts_now() { date +%s; }
+charge() { cat "\$BAT/charge_now" 2>/dev/null || echo 0; }
+full() { cat "\$BAT/charge_full" 2>/dev/null || echo 0; }
+state() { cat "\$BAT/status" 2>/dev/null || echo unknown; }
+if [ "\${1:-}" = pre ]; then
+  printf '%s %s %s %s\n' "\$(ts_now)" "\$(charge)" "\$(full)" "\$(state)" > /run/omarchy-sleep-measure.pre
+  exit 0
+fi
+if [ "\${1:-}" = post ] || [ "\${1:-}" = post-resume ]; then
+  pre=/run/omarchy-sleep-measure.pre
+  [ -r "\$pre" ] || exit 0
+  read -r pre_ts pre_charge pre_full pre_state < "\$pre"
+  now=\$(ts_now); post_charge=\$(charge)
+  if [ "\$pre_state" = Discharging ] && [ "\${pre_full:-0}" -gt 0 ] && [ "\$now" -gt "\$pre_ts" ]; then
+    pct=\$(awk -v a="\$pre_charge" -v b="\$post_charge" -v f="\$pre_full" 'BEGIN{d=100*(a-b)/f; if(d<0)d=0; printf "%.2f", d}')
+    hours=\$(awk -v s="\$pre_ts" -v e="\$now" 'BEGIN{printf "%.3f",(e-s)/3600}')
+    rate=\$(awk -v d="\$pct" -v h="\$hours" 'BEGIN{printf "%.2f", (h>0 ? d/h : 0)}')
+    printf '[measure %s] %s%% of full over %sh -> %s%%/h  (sleep mode, %s)\n' \\
+      "\$(date -Is)" "\$pct" "\$hours" "\$rate" "\$(cat /sys/power/mem_sleep 2>/dev/null)" >> "\$LOG"
+  else
+    printf '[measure %s] skipped (was %s)\n' "\$(date -Is)" "\$pre_state" >> "\$LOG"
+  fi
+  rm -f "\$pre"
+fi
+exit 0
+EOF
+  chmod 755 "$HOOK"
+}
+
+write_s0ix_hook() {
+  mkdir -p "$HOOKDIR"
+  cat > "$S0IX_HOOK" <<EOF
+#!/usr/bin/env bash
+# Logs S0ix (s2idle) residency across suspend/resume.
+PMC=$PMC
+LOG=$LOG
+STATE=/run/omarchy-s0ix-measure.pre
+now() { date +%s; }
+read_res() { cat "\$PMC" 2>/dev/null || true; }
+
+if [ "\${1:-}" = pre ]; then
+  r=\$(read_res)
+  [ -n "\$r" ] && printf '%s %s\n' "\$(now)" "\$r" > "\$STATE"
+  exit 0
+fi
+
+if [ "\${1:-}" = post ] || [ "\${1:-}" = post-resume ]; then
+  [ -r "\$STATE" ] || exit 0
+  read -r t0 r0 < "\$STATE"
+  r1=\$(read_res); t1=\$(now)
+  if [ -n "\$r1" ] && [ "\$t1" -gt "\$t0" ]; then
+    dur=\$(( t1 - t0 ))
+    dr=\$(( r1 - r0 ))
+    pct=\$(awk -v d="\$dr" -v s="\$dur" 'BEGIN{printf "%.1f",(s>0?100*d/1000000/s:0)}')
+    printf '[s0ix %s] residency %s%% during %ss sleep (delta %sus)\n' \\
+      "\$(date -Is)" "\$pct" "\$dur" "\$dr" >> "\$LOG"
+  else
+    printf '[s0ix %s] residency unavailable (%s missing?)\n' \\
+      "\$(date -Is)" "\$PMC" >> "\$LOG"
+  fi
+  rm -f "\$STATE"
+fi
+exit 0
+EOF
+  chmod 755 "$S0IX_HOOK"
+}
+
+cmd_install() {
+  need_root install
+  say "installing to $DEST"
+  install -m 0755 "$0" "$DEST"
+  cmd_apply
+  write_unit
+  write_hook
+  write_s0ix_hook
+  systemctl daemon-reload
+  systemctl enable omarchy-sleep-tune.service >/dev/null
+  say "installed"
+  printf '   %s (enabled)\n' "$UNIT"
+  printf '   %s (drain logging)\n' "$HOOK"
+  printf '   %s (S0ix residency logging)\n' "$S0IX_HOOK"
+  echo
+  echo "   reboot, suspend, then: omarchy-sleep-tune measure"
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  systemctl disable --now omarchy-sleep-tune.service 2>/dev/null
+  rm -f "$UNIT" "$HOOK" "$S0IX_HOOK"
+  systemctl daemon-reload
+  echo "removed unit and hooks (tuning already applied stays applied until reboot)"
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  apply) cmd_apply ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  measure) cmd_measure ;;
+  *) sed -n '2,13p' "$0" ;;
+esac

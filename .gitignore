@@ -1,0 +1,8 @@
+# Editor / OS noise
+*.swp
+*.tmp
+*~
+.DS_Store
+
+# Local captured diagnostics
+*.log
