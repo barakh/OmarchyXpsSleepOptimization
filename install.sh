@@ -4,6 +4,7 @@
 #   1. force PCIe ASPM via the kernel cmdline (the actual S0ix fix)
 #   2. install the sleep-tune helper + systemd unit + suspend/resume hooks
 #   3. re-apply userspace tuning (Wi-Fi power save, powertop, wake trimming)
+#   4. make the IPU6 webcam visible to PipeWire/Chromium (bonus fix)
 #
 # Run:
 #   sudo ./install.sh
@@ -29,7 +30,7 @@ if grep -q "doesn't support PCIe ASPM" <(dmesg 2>/dev/null || true); then
   echo "firmware: FADT says ASPM unsupported  -> aspm-force is needed"
 fi
 
-say "1/3  removing legacy aspm-powersupersave.service (if any)"
+say "1/4  removing legacy aspm-powersupersave.service (if any)"
 if [ -f /etc/systemd/system/aspm-powersupersave.service ]; then
   systemctl disable --now aspm-powersupersave.service 2>/dev/null || true
   mv /etc/systemd/system/aspm-powersupersave.service \
@@ -39,10 +40,13 @@ else
   echo "not present"
 fi
 
-say "2/3  installing sleep-tune helper + unit + hooks"
+say "2/4  installing sleep-tune helper + unit + hooks"
 bash "$DIR/scripts/omarchy-sleep-tune" install
 
-say "3/3  forcing PCIe ASPM on the kernel cmdline"
+say "3/4  enabling the IPU6 camera for PipeWire/Chromium"
+bash "$DIR/scripts/camera-fix.sh" install
+
+say "4/4  forcing PCIe ASPM on the kernel cmdline"
 bash "$DIR/scripts/aspm-force.sh" on
 
 cat <<EOF
@@ -57,4 +61,6 @@ Next:
        sudo $DIR/scripts/s0ix-latch.sh 60
   4. Sleep the laptop a few hours, then read the measured drain:
        omarchy-sleep-tune measure
+  5. Relaunch Chromium and check the camera (should be "Built-in Front Camera"):
+       wpctl status | sed -n '/Sources/,/Filters/p'
 EOF

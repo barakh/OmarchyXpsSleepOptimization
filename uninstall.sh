@@ -3,6 +3,7 @@
 # uninstall.sh - revert the changes made by install.sh:
 #   - remove pcie_aspm=force from the kernel cmdline
 #   - remove the sleep-tune unit and suspend/resume hooks
+#   - disable the Chromium IPU6 camera flag
 #
 # Run:
 #   sudo ./uninstall.sh
@@ -33,5 +34,8 @@ fi
 
 say "removing forced PCIe ASPM from the kernel cmdline"
 bash "$DIR/scripts/aspm-force.sh" off
+
+say "disabling the IPU6 camera Chromium flag"
+bash "$DIR/scripts/camera-fix.sh" uninstall
 
 echo "Reboot to apply. log files in /var/log are left in place."

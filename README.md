@@ -91,6 +91,37 @@ overnight sleep now costs roughly **7 %** of the battery instead of ~50 %.
 
 ---
 
+## Bonus fix: IPU6 camera not visible to Chromium / PipeWire
+
+The internal webcam on this machine is an IPU6 (MIPI/raw-Bayer) sensor
+(`ov01a10`), not a V4L2/UVC camera. Chromium on Wayland reaches cameras through
+PipeWire, which in turn gets them from WirePlumber via libcamera. Two things are
+missing by default on Omarchy 4.0.4, so Chromium shows **no camera** even though
+libcamera itself works (`cam -l` lists "Internal front camera", `qcam` previews):
+
+1. the **`pipewire-libcamera`** package (the libcamera SPA plugin). Without it
+   WirePlumber logs
+   `s-monitors-libcamera: PipeWire's libcamera SPA plugin is missing or broken.`
+   and the camera never appears as a PipeWire source; and
+2. Chromium's **PipeWire camera backend** is not enabled.
+
+`scripts/camera-fix.sh` installs the plugin, adds `WebRtcPipeWireCamera` to
+`--enable-features` in the desktop user's `~/.config/chromium-flags.conf`, and
+restarts WirePlumber/PipeWire. After relaunching Chromium the camera appears as
+**"Built-in Front Camera"**.
+
+Verify without Chromium:
+
+```sh
+cam -l                     # libcamera: "Internal front camera"
+wpctl status               # PipeWire "Sources:" lists Built-in Front Camera
+```
+
+`sudo ./scripts/camera-fix.sh uninstall` reverts the Chromium flag (the package
+is left installed, since other PipeWire camera apps need it).
+
+---
+
 ## What install.sh changes
 
 1. **Kernel cmdline** (via Limine by default; GRUB and systemd-boot are also
@@ -120,6 +151,11 @@ overnight sleep now costs roughly **7 %** of the battery instead of ~50 %.
 
 5. Removes a broken legacy `aspm-powersupersave.service` if present.
 
+6. Installs the **`pipewire-libcamera`** package, adds `WebRtcPipeWireCamera` to
+   the desktop user's `~/.config/chromium-flags.conf`, and restarts
+   WirePlumber/PipeWire so the IPU6 camera shows up in Chromium (see the bonus
+   fix above).
+
 ### Verify
 
 ```sh
@@ -143,6 +179,7 @@ omarchy-sleep-tune status
 | `scripts/s0ix-diag.sh [--suspend]` | Read-only dump of PMC/LTR/ASPM/suspend state; `--suspend` adds a 90 s controlled sleep. |
 | `scripts/s0ix-bisect.sh [case]` | Unbinds candidate drivers (camera/audio/USB) one at a time and measures residency. Use only if ASPM is *not* the cause. |
 | `scripts/aspm-force.sh on\|off\|status\|restore-usb` | Toggle the kernel-cmdline ASPM fix and check state. |
+| `scripts/camera-fix.sh install\|uninstall\|status` | Make the IPU6 webcam visible to PipeWire/Chromium (installs `pipewire-libcamera`, sets the Chromium flag). |
 
 ## Uninstall
 
